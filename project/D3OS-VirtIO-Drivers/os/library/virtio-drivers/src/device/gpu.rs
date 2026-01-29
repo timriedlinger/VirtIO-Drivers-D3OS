@@ -15,7 +15,7 @@ const QUEUE_SIZE: u16 = 16;
 const SUPPORTED_FEATURES: Features = Features::RING_EVENT_IDX
     .union(Features::RING_INDIRECT_DESC)
     .union(Features::VERSION_1)
-    .union(Features::VIRGL);
+    .union(Features::VIRGL); // neu
 
 const SURFACE_ID_COLOR: u32 = 0x2001;
 
@@ -262,14 +262,14 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
     }
     // neu - für resize
     fn destroy_framebuffer(&mut self, rect_for_scanout: Rect) {
-        // Scanout lösen (Host soll nicht mehr aus alter Resource scannen)
+        // 1) Scanout lösen (Host soll nicht mehr aus alter Resource scannen)
         let _ = self.set_scanout(rect_for_scanout, SCANOUT_ID, 0);
 
-        // Backing lösen + 3) Resource freigeben
+        // 2) Backing lösen + 3) Resource freigeben
         let _ = self.resource_detach_backing(RESOURCE_ID_FB);
         let _ = self.resource_unref(RESOURCE_ID_FB);
 
-        // Treiber-State droppen (damit DMA freigegeben wird)
+        // 4) Treiber-State droppen (damit DMA freigegeben wird)
         self.frame_buffer_dma = None;
         self.rect = None;
     }
@@ -601,7 +601,7 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
             width, height, 1, 1, 0, 0, 0
         )?;
 
-        // Ressource an Kontext binden
+        // 4) Ressource an Kontext binden
         self.ctx_attach_resource(ctx_id, res_id)?;
 
         // 5) Scanout direkt auf 3D-Ressource
