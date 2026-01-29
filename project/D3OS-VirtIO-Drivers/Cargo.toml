@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+
+members = [
+    "os/kernel",
+    "os/application/about",
+    "os/application/hello",
+    "os/application/helloc",
+    "os/application/shell",
+    "os/application/uptime",
+    "os/application/date",
+    "os/application/ls",
+    "os/application/heaptest",
+    "os/application/threadtest",
+    "os/application/ntest"
+]
+
+# [profile.release]
+# debug = true

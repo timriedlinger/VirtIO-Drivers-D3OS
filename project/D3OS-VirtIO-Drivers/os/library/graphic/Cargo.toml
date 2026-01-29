@@ -1,0 +1,8 @@
+[package]
+edition = "2024"
+name = "graphic"
+version = "0.1.0"
+authors = ["Michael Schöttner <michael.schoettner@hhu.de>, Fabian Ruhland <ruhland@hhu.de>"]
+
+[dependencies]
+unifont = "1.1.0"
