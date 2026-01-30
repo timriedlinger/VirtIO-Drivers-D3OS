@@ -421,7 +421,7 @@ pub extern "C" fn start(multiboot2_magic: u32, multiboot2_addr: *const BootInfor
 
     test_rng();
 
-    play_pcm_file();
+    //play_pcm_file();
 
     //test_virgl();
 
