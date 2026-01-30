@@ -6,4 +6,22 @@
 
 # :notebook: &nbsp; Aufgabenbeschreibung
 
-_Hier den erstellten Entwurf einfügen_
+# Ziele der Bachelorarbeit
+
+- **VirtIO-Treiberbasis in D3OS integrieren**  
+  - Virtio-GPU-Gerät erkennen und initialisieren  
+  - Einbindung der Rust-Crate virtio-drivers als wiederverwendbare Treiberbasis 
+  - Grundlage schaffen, um weitere VirtIO-Geräte später konsistent aktivieren zu können  
+
+- **VirtIO-GPU Erweiterung**  
+  - Resize Unterstützung für Auflösungsänderungen
+  - VirGL Fähigkeit hinzufügen 
+
+- **Demo-Anwendungen**  
+  - VirGL Funktionstest 
+  - VirtIO Sound Playback Test
+  - Rectangle Demo anpassen auf Crate Implementierug
+
+- **Performance-Test**  
+  - Benchmarking der GPU-Integration
+  - Messung der Renderzeit für einfache 2D-Operationen  
