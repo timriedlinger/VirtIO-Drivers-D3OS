@@ -20,8 +20,8 @@
 - **Demo-Anwendungen**  
   - VirGL Funktionstest 
   - VirtIO Sound Playback Test
-  - Rectangle Demo anpassen auf Crate Implementierug
+  - Rectangle Demo anpassen auf Crate Implementierung
 
 - **Performance-Test**  
   - Benchmarking der GPU-Integration
-  - Messung der Renderzeit für einfache 2D-Operationen  
+  - Vergleich WSL2 und Ubuntu25 als Host 
