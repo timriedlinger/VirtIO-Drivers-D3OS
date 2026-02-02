@@ -275,8 +275,8 @@ Die Spezifikation definiert für das Sound-Gerät vier spezialisierte Warteschla
   \label{fig:audio}
 \end{figure}
 
-Die in Abbildung 2.4 dargestellte Architektur visualisiert den Datenfluss innerhalb der TX Queue während der Audiowiedergabe. Auf der linken Seite platziert der VirtIO-Sound-Treiber des Gastsystems Audiodaten in Form von einzelnen Perioden (hier nummeriert als #0 bis #3) in den Available Ring. Dieser Ring fungiert als geteilter Speicherbereich, über den der Treiber neue Aufgaben ankündigt.\\
-Auf der Host-Seite (rechts) überwacht ein Queue Handler diesen Ring. Sobald neue Puffer verfügbar sind, im Diagramm exemplarisch Puffer #0, werden diese entnommen (pop) und verarbeitet. Das Diagramm zeigt hierbei Pipewire als das Audio-Backend des Hosts. Dies repräsentiert eine typische Konfiguration auf modernen Linux-Hostsystemen (wie dem in der Evaluation genutzten Ubuntu 25.10), bei denen der Hypervisor (QEMU) die Audiodaten aus dem Virtqueue direkt an den Pipewire-Soundserver des Hosts weiterleitet, um die Ausgabe zu realisieren.
+Die in Abbildung 2.4 dargestellte Architektur visualisiert den Datenfluss innerhalb der TX Queue während der Audiowiedergabe. Auf der linken Seite platziert der VirtIO-Sound-Treiber des Gastsystems Audiodaten in Form von einzelnen Perioden (hier nummeriert als 0 bis 3) in den Available Ring. Dieser Ring fungiert als geteilter Speicherbereich, über den der Treiber neue Aufgaben ankündigt.\\
+Auf der Host-Seite (rechts) überwacht ein Queue Handler diesen Ring. Sobald neue Puffer verfügbar sind, im Diagramm exemplarisch Puffer 0, werden diese entnommen (pop) und verarbeitet. Das Diagramm zeigt hierbei Pipewire als das Audio-Backend des Hosts. Dies repräsentiert eine typische Konfiguration auf modernen Linux-Hostsystemen (wie dem in der Evaluation genutzten Ubuntu 25.10), bei denen der Hypervisor (QEMU) die Audiodaten aus dem Virtqueue direkt an den Pipewire-Soundserver des Hosts weiterleitet, um die Ausgabe zu realisieren.
 
 \subsubsection{Logische Komponenten: Jacks und Streams}
 
