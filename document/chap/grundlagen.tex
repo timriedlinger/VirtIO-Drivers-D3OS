@@ -133,7 +133,7 @@ Der Ring ist als Ringpuffer implementiert, der Indizes enthält, die auf die Kö
  \item Er inkrementiert den idx-Zeiger des Rings, um dem Gerät zu signalisieren, dass neue Arbeit vorliegt.
 \end{enumerate}
 
-Ein entscheidender Aspekt ist hier die Trennung von Daten und Signalisierung. Das bloße Eintragen in den Ring löst noch keine Verarbeitung aus. Erst durch einen expliziten "Kick" (in der Regel ein PIO-Write auf ein Doorbell-Register) wird der Hypervisor/das Gerät benachrichtigt. Um die Anzahl dieser teuren VM-Exits zu reduzieren, unterstützt VirtIO Mechanismen zur Event-Unterdrückung (\code{VIRTIO\_F\_EVENT\_IDX}), bei denen das Gerät dem Treiber mitteilen kann, erst nach einer bestimmten Anzahl neuer Aufträge wieder geweckt zu werden.
+Ein entscheidender Aspekt ist hier die Trennung von Daten und Signalisierung. Das bloße Eintragen in den Ring löst noch keine Verarbeitung aus. Erst durch einen expliziten „Kick“ (in der Regel ein PIO-Write auf ein Doorbell-Register) wird der Hypervisor/das Gerät benachrichtigt. Um die Anzahl dieser teuren VM-Exits zu reduzieren, unterstützt VirtIO Mechanismen zur Event-Unterdrückung (\code{VIRTIO\_F\_EVENT\_IDX}), bei denen das Gerät dem Treiber mitteilen kann, erst nach einer bestimmten Anzahl neuer Aufträge wieder geweckt zu werden.
 
 \subsubsection{Used Ring}
 
@@ -162,7 +162,7 @@ Um diesen Overhead zu adressieren, führt der VirtIO 1.1-Standard das Konzept de
 Die Funktionsweise unterscheidet sich dabei grundlegend in der Zustandsverwaltung:
 
 \begin{itemize}
- \item Einheitliche Deskriptoren: Jeder Eintrag im Ring enthält sowohl die Daten-Metadaten (Adresse, Länge) als auch den Status des Eintrags. Es gibt keine separaten Indizes für Available oder Used.
+ \item Einheitliche Deskriptoren: Jeder Eintrag im Ring enthält sowohl die Daten"=Metadaten (Adresse, Länge) als auch den Status des Eintrags. Es gibt keine separaten Indizes für Available oder Used.
  \item Wrap-Counter-Logik: Anstelle eines stetig wachsenden Index wird ein Wrap Counter (Umlaufzähler) verwendet, der als binäres Flag in jedem Deskriptor realisiert ist \cite{RedHatPacked}. Bei jedem Durchlauf des Rings „flippt“ dieses Bit. Treiber und Gerät erkennen anhand dieses Bits, ob ein Eintrag neu bereitgestellt wurde oder noch veraltet ist, ohne auf externe Index-Variablen zugreifen zu müssen.
 \end{itemize}
 
