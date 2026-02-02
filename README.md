@@ -41,3 +41,4 @@
 - **Sonstiges** 
   - Git Version: 92cb6f3
   - Compiler: rustc 1.91.0-nightly (fe5536432 2025-08-29)
+  - für VirGL wird virglrenderer Hostseitig vorausgesetzt
