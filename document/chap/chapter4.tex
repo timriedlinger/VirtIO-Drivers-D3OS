@@ -1,0 +1,379 @@
+\chapter{VirtIO-GPU und Erweiterungen}
+
+\section{Erweiterung um VirGL und 3D-Kommandos}
+
+Dieser Kapitelabschnitt basiert auf Änderungen an \code{gpu.rs} innerhalb der lokalen virtio-drivers-Quellen, da die VirGL-Unterstützung zusätzliche Protokollbestandteile, Kommandostrukturen und Hilfsfunktionen erfordert. Ziel ist dabei nicht der Aufbau eines vollständigen 3D-Stacks, sondern die Ergänzung genau der Funktionen, die zur Ausführung der in Abschnitt 4.2 beschriebenen \code{test\_virgl}-Routine notwendig sind.
+
+Die Erweiterung um VirGL basiert auf der VirtIO-GPU-Spezifikation, in der für 3D-fähige Geräte zusätzliche ControlQ-Kommandos definiert sind.
+Damit der Treiber überhaupt 3D-Kommandos an das Gerät senden darf, wird VirGL als unterstütztes Feature in die Feature-Maske aufgenommen. Dies stellt sicher, dass die Feature-Negotiation VirGL aushandeln kann, sofern das Gerät diese Fähigkeit anbietet.
+
+\begin{codeblock}{gpu.rs}{Rust}
+  \begin{rustcode}
+const SUPPORTED_FEATURES: Features = Features::RING_EVENT_IDX
+    .union(Features::RING_INDIRECT_DESC)
+    .union(Features::VERSION_1)
+    .union(Features::VIRGL); // neu
+  \end{rustcode}
+\end{codeblock}
+
+Die clientseitige Aktivierung des Feature-Bits ist jedoch nur wirksam, wenn die Virtualisierungsumgebung die entsprechende 3D-Funktionalität ebenfalls exponiert. In der verwendeten QEMU-Konfiguration (definiert in \code{Makefile.toml}) muss hierfür das Gerät \code{virtio-vga-gl} sowie ein OpenGL-fähiges Display-Backend aktiviert werden. Dies erfolgt über die Startparameter:
+
+\begin{codeblock}{Makefile.toml}{TOML}
+  \begin{rustcode}
+# VirtIO GPU
+"-display", "gtk,gl=on", "-device", "virtio-vga-gl"
+  \end{rustcode}
+\end{codeblock}
+
+Erst durch diese Parameter bietet das Gerät das VIRGL-Featurebit beim Handshake an. Ob die Aushandlung erfolgreich war, lässt sich zur Laufzeit anhand der Debug-Ausgaben der Treiberinitialisierung verifizieren. Eine Ausgabe wie:
+
+\begin{terminalblock}
+  \begin{textcode}
+[0.266][INF][gpu.rs@366] [gpu device] negotiated_features: Features(VIRGL | RING_INDIRECT_DESC | RING_EVENT_IDX | VERSION_1)
+  \end{textcode}
+\end{terminalblock}
+
+dokumentiert die Schnittmenge der vom Host angebotenen und vom Gast akzeptierten Features. Enthält diese Liste das VIRGL-Flag nicht, stehen die 3D-Kommandos (ab 0x200) nicht zur Verfügung.
+
+Damit der Treiber diese nun ausgehandelte Funktionalität nutzen kann, müssen die entsprechenden Protokollwerte in der Software abgebildet werden. Zunächst werden die 3D-spezifischen Command-IDs ergänzt. Sie liegen im Bereich 0x200 bis 0x207 und decken Kontextverwaltung, 3D-Resource-Erzeugung, Transfers und Command-Submission ab.
+
+\begin{codeblock}{gpu.rs}{Rust}
+  \begin{rustcode}
+const CTX_CREATE: Command = Command(0x200);
+const CTX_DESTROY: Command = Command(0x201);
+const CTX_ATTACH_RESOURCE: Command = Command(0x202);
+const CTX_DETACH_RESOURCE: Command = Command(0x203);
+const RESOURCE_CREATE_3D: Command = Command(0x204);
+const TRANSFER_TO_HOST_3D: Command = Command(0x205);
+const TRANSFER_FROM_HOST_3D: Command = Command(0x206);
+const CMD_SUBMIT_3D: Command = Command(0x207);
+  \end{rustcode}
+\end{codeblock}
+
+Die zugehörigen Request-Strukturen werden im Treiber als \code{#[repr(C)]}-Strukturen definiert. Damit ist sichergestellt, dass das Speicherlayout den Spezifikationsstrukturen entspricht. In Kombination mit den verwendeten Zerocopy-Traits (\code{IntoBytes}, \code{FromBytes}, \code{KnownLayout}, \code{Immutable}) können Requests deterministisch in einen Sendepuffer geschrieben und Responses zuverlässig aus einem Empfangspuffer gelesen werden.
+
+Die neu eingeführten Typen werden im Folgenden funktional gruppiert:
+
+\begin{itemize}
+ \item Kontextverwaltung: \code{CtxCreate}, \code{CtxDestroy}\\
+ Erzeugt bzw. zerstört einen 3D-Kontext, an den Ressourcen gebunden werden können.
+ \item Kontext–Ressource-Bindung: \code{CtxAttachResource}, \code{CtxDetachResource}\\
+ Verknüpft eine 3D-Resource mit einem Kontext (Voraussetzung für Submission).
+ \item 3D-Resource: \code{ResourceCreate3D}\\
+ Erzeugt eine 3D-Resource mit Parametern wie Format, Bind-Flags und Abmessungen.
+ \item 3D-Transfer: \code{TransferToHost3D}, \code{TransferFromHost3D} und Hilfstyp \code{Box3D}\\
+ transferiert eine 3D-Region-Box zwischen Gast-Backing und Host.
+ \item Submit: \code{Submit3D}\\
+ Trägt Metadaten zur Länge des nachfolgenden Command-Streams; die Bytes selbst werden separat übertragen.
+\end{itemize}
+
+Der folgende Quelltext zeigt exemplarisch eine der zentralen Nachrichten, ResourceCreate3D, die im Smoke Test als Render-Target angelegt wird:
+\begin{codeblock}{gpu.rs}{Rust}
+  \begin{rustcode}
+#[repr(C)]
+#[derive(Debug, Immutable, IntoBytes, KnownLayout)]
+struct ResourceCreate3D {
+    header: CtrlHeader,
+    resource_id: u32,
+    target: u32,
+    format: u32,
+    bind: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+    array_size: u32,
+    last_level: u32,
+    nr_samples: u32,
+    flags: u32,
+    _padding: u32,
+}
+  \end{rustcode}
+\end{codeblock}
+
+Ein wesentlicher Unterschied zur 2D-Implementierung ist, dass bestimmte 3D-Kommandos neben dem festen Request-Header einen zusätzlichen Datenpuffer übertragen müssen:
+
+\begin{itemize}
+ \item bei \code{CTX\_CREATE} wird der Debug-Name zusätzlich als Bytefolge übertragen,
+ \item bei \code{CMD\_SUBMIT\_3D} folgt der eigentliche Command-Stream als Byte-Slice.
+\end{itemize}
+
+Dafür wird eine zusätzliche Request-Funktion eingeführt, die Header und Daten als verkettete Descriptor-Kette an die Control-Queue übergibt. Dadurch bleibt die Nachrichtenstruktur typisiert, während variable Daten ohne manuelle Kopierlogik mitgesendet werden können.
+
+\begin{codeblock}{gpu.rs}{Rust}
+  \begin{rustcode}
+fn request_with_data<Req: IntoBytes + Immutable, Rsp: FromBytes>(
+    &mut self,
+    req: Req,
+    data: &[u8],
+) -> Result<Rsp> {
+    req.write_to_prefix(&mut self.queue_buf_send).unwrap();
+    let header_len = core::mem::size_of::<Req>();
+
+    self.control_queue.add_notify_wait_pop(
+        &[&self.queue_buf_send[..header_len], data],
+        &mut [&mut self.queue_buf_recv],
+        &mut self.transport,
+    )?;
+    Ok(Rsp::read_from_prefix(&self.queue_buf_recv).unwrap().0)
+}
+  \end{rustcode}
+\end{codeblock}
+
+Auf Basis der neuen Strukturen werden Treibermethoden ergänzt, die jeweils eine konkrete Protokolloperation kapseln und im Erfolgsfall \code{OK\_NODATA} erwarten. Beispiele sind:
+
+\begin{itemize}
+    \item \code{resource\_create\_3d(...)} $\rightarrow$ sendet \code{RESOURCE\_CREATE\_3D}
+    \item \code{context\_create(ctx\_id, name)} $\rightarrow$ sendet \code{CTX\_CREATE} + Name über\\ \code{request\_with\_data}
+    \item \code{ctx\_attach\_resource(ctx\_id, res\_id)} $\rightarrow$ sendet \code{CTX\_ATTACH\_RESOURCE}
+    \item \code{transfer\_from\_host\_3d(...)} $\rightarrow$ sendet \code{TRANSFER\_FROM\_HOST\_3D}
+    \item \code{submit\_3d(ctx\_id, commands)} $\rightarrow$ sendet \code{CMD\_SUBMIT\_3D} + Command-Stream über \code{request\_with\_data}
+\end{itemize}
+
+Der nachfolgende Quelltext zeigt die Submission-Funktion als repräsentatives Beispiel. Hier wird zusätzlich eine Fence-ID gesetzt, um Submissions zur Synchronisation mit Sequenznummern eindeutig zu markieren.
+
+\begin{codeblock}{gpu.rs}{Rust}
+  \begin{rustcode}
+fn submit_3d(&mut self, ctx_id: u32, commands: &[u8]) -> Result {
+    let mut header = CtrlHeader::with_type(Command::CMD_SUBMIT_3D);
+    header.ctx_id = ctx_id;
+
+    static mut NEXT_FENCE: u64 = 1;
+    let fence = unsafe { let f = NEXT_FENCE; NEXT_FENCE += 1; f };
+    header.flags = GPU_FLAG_FENCE;
+    header.fence_id = fence;
+
+    let submit_cmd = CmdSubmit3D { header, size: commands.len() as u32, _padding: 0 };
+
+    let rsp: CtrlHeader = self.request_with_data(submit_cmd, commands)?;
+    rsp.check_type(Command::OK_NODATA)
+}
+  \end{rustcode}
+\end{codeblock}
+
+\section{VirGL Smoke Test}
+
+Dieser Kapitelabschnitt basiert auf der in \code{gpu.rs} implementierten Funktion \code{test\_virgl} sowie den hierfür ergänzten Encoder-Routinen zur Erzeugung eines VirGL-Command-Streams. Ziel des Smoke Tests ist es, den vollständigen 3D-Pfad einmal „end-to-end“ zu durchlaufen. Ein minimaler 3D-Render-Schritt wird am Host ausgelöst. Anschließend wird das Ergebnis in den Gast zurückgelesen und über den bestehenden 2D-Framebuffer sichtbar gemacht. Damit wird die prinzipielle Nutzbarkeit der VirGL-Erweiterung nachgewiesen, ohne einen vollständigen 3D-Stack im Gast vorauszusetzen.
+
+Die im Smoke Test verwendeten Encoder sind an die Definitionen aus \code{virgl\_protocol.h} angelehnt, wie sie z. B. in virglrenderer bereitgestellt werden \cite{VirglProtocol}. 
+Ein VirGL-Kommando besteht aus einem 32-Bit Headerwort mit folgendem Layout: 8 Bit Command, 8 Bit Objekt-Typ und 16 Bit Länge (in 32-Bit-Wörtern). Dieses Layout wird durch das Makro \code{VIRGL\_CMD0(cmd, obj, len)} beschrieben.
+
+Der Folgende Code zeigt die dazu passende Hilfsfunktion \code{virgl\_cmd0} sowie die elementaren „push“-Funktionen zur Little-Endian-Serialisierung. Die Command-Streams werden als Byte-Vektor aufgebaut, wobei die Protokolleinheiten jeweils als Folge von 32-Bit-Wörtern (und bei Bedarf 64-Bit-Floats) kodiert werden.
+
+\begin{codeblock}{gpu.rs}{Rust}
+  \begin{rustcode}
+#[inline]
+fn virgl_cmd0(cmd: u32, obj: u32, len_u32: u32) -> u32 {
+    // entspricht VIRGL_CMD0(cmd,obj,len)
+    cmd | (obj << 8) | (len_u32 << 16)
+}
+
+#[inline]
+fn push_u32(buf: &mut Vec<u8>, v: u32) { buf.extend_from_slice(&v.to_le_bytes()); }
+
+#[inline]
+fn push_f32(buf: &mut Vec<u8>, f: f32) { push_u32(buf, f.to_bits()); }
+
+#[inline]
+fn push_f64(buf: &mut Vec<u8>, d: f64) {
+    let bits = d.to_bits();
+    buf.extend_from_slice(&(bits as u32).to_le_bytes());         // low  32
+    buf.extend_from_slice(&((bits >> 32) as u32).to_le_bytes()); // high 32
+}
+  \end{rustcode}
+\end{codeblock}
+
+Auf Basis dieser Hilfsfunktionen wird ein kleiner Satz an Encodern implementiert, der für den Smoke Test ausreicht. Inhaltlich bilden die Encoder jeweils genau eine Protokolloperation aus \code{virgl\_protocol.h} ab: Surface erzeugen, Framebuffer-State setzen, Viewport setzen und einen Clear durchführen.
+
+Im Folgenden wird exemplarisch der Encoder \code{encode\_create\_surface} gezeigt. Jeder Encoder beginnt mit dem Schreiben eines 32-Bit-Headerworts, das über \code{virgl\_cmd0} erzeugt wird. Der Parameter \code{len} gibt dabei die Anzahl der unmittelbar folgenden Payload-Wörter in 32 Bit an. Entsprechend werden nach dem Header genau \code{len} Werte per \code{push\_u32} in den Command-Stream geschrieben. Im Beispiel ist \code{len = 5}, weshalb auf den Header genau fünf 32-Bit-Wörter folgen.
+
+\begin{codeblock}{gpu.rs}{Rust}
+  \begin{rustcode}
+fn encode_create_surface(buf: &mut Vec<u8>, surf_handle: u32, res_handle: u32, format: u32) {
+    // Header: Command + Objekt + Payload-Länge (in u32-Wörtern)
+    push_u32(buf, virgl_cmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SURFACE, 5));
+
+    // Payload: genau 5 u32-Wörter gemäß len=5
+    push_u32(buf, surf_handle);
+    push_u32(buf, res_handle);
+    push_u32(buf, format);
+    push_u32(buf, 0); // level = 0
+    push_u32(buf, 0); // layers = 0 (first=0,last=0)
+}
+  \end{rustcode}
+\end{codeblock}
+
+Die weiteren im Smoke Test genutzten Encoder folgen demselben Schema: Zunächst wird ein Headerwort mit der passenden Command-ID und Payload-Länge geschrieben, anschließend werden die jeweils spezifizierten Parameter in der vorgegebenen Reihenfolge serialisiert. Dadurch entsteht ein deterministischer Byte-Stream, der anschließend über \code{CMD\_SUBMIT\_3D} an den Host übertragen werden kann.
+
+Der Smoke Test setzt die in Abschnitt 4.1 beschriebenen 3D-Erweiterungen in einer festen Abfolge ein. Diese Abfolge ist so gewählt, dass sie mit minimalem Umfang eine vollständige 3D-Roundtrip-Interaktion abbildet:
+
+\begin{enumerate}
+    \item \code{context\_create}: Erzeugt einen 3D-Kontext, der als Ausführungskontext für Submissions dient.
+    \item \code{resource\_create\_3d}: Erzeugt eine 3D-Resource als Render-Target in der gewünschten Auflösung.
+    \item \code{ctx\_attach\_resource}: Bindet die Resource an den Kontext.
+    \item \code{encode\_*}: Erzeugt einen minimalen Virgl-Command-Stream (Surface, FB-State, Viewport, Clear).
+    \item \code{submit\_3d}: Sendet den Command-Stream an den Host. Optional wird eine Fence-ID gesetzt, um Submissions auf einer Synchronisations-Timeline eindeutig zu markieren.
+    \item \code{flush}: Bild sichtbar machen.
+\end{enumerate}
+
+Der folgende Code zeigt diese Pipeline als strukturierte Sequenz (schematisch, d. h. ohne alle Parameter):
+
+\begin{codeblock}{gpu.rs}{Rust}
+  \begin{rustcode}
+// 1) Kontext + 3D-Resource
+context_create(ctx_id, "smoke")?;
+resource_create_3d(res_id, /*target, format, bind, w, h, ...*/)?;
+ctx_attach_resource(ctx_id, res_id)?;
+
+// 2) VirGL Command Stream aufbauen
+let mut cmds = Vec::new();
+encode_create_surface(&mut cmds, surf_id, res_id, format);
+encode_set_framebuffer_state(&mut cmds, surf_id, 0);
+encode_set_viewport_full(&mut cmds, width, height);
+encode_clear_color(&mut cmds, 0.094, 0.416, 0.067, 1.0); //RGBA Colors
+
+// 3) Submit
+submit_3d(ctx_id, &cmds)?;
+
+// 4) Flush
+resource_flush(rect, res_id)?;
+  \end{rustcode}
+\end{codeblock}
+
+Dieser Programmablauf demonstriert zudem den architektonischen Vorteil der 3D-Beschle\-unigung gegenüber dem klassischen 2D-Modus. Während bei der 2D-Implementierung zwingend ein physischer Speicherbereich (Backing Store) im Gast-RAM reserviert und dessen Inhalt mittels \code{TRANSFER\_TO\_HOST\_2D} zyklisch an den Host kopiert werden muss, entfällt dieser Schritt bei der direkten 3D-Nutzung. Da der virglrenderer die Befehle des Command-Streams unmittelbar auf der Host-GPU ausführt, entstehen die Bilddaten direkt im Videospeicher der Host-Ressource. Es ist daher im Gastsystem weder das Vorhalten eines gefüllten Pixelpuffers noch ein bandbreitenintensiver Datentransfer erforderlich. Dieser Zero-Copy-Ansatz reduziert die Latenz signifikant, da zur Aktualisierung der Anzeige lediglich der \code{RESOURCE\_FLUSH}-Befehl gesendet werden muss, der dem Hypervisor die Fertigstellung des Frames signalisiert.\\
+\\
+Weiter wird im Smoke Test die Hintergrundfarbe über \code{encode\_clear\_color} gesetzt. Die Funktion erwartet die Farbkanäle als Gleitkommazahl im Bereich [0,1], also in einer normalisierten Darstellung. Zur Einordnung kann diese Darstellung in 8-Bit-RGBA-Werte [0,255] umgerechnet werden, indem mit 255 multipliziert wird. Für die im Test verwendeten Werte ergibt sich damit näherungsweise: $R = 0.094 \cdot 255 \approx 24, G = 0.416 \cdot 255 \approx 106, B = 0.067 \cdot 255 \approx 17, A = 1.0 \cdot 255 = 255.$ Damit entspricht der Clear-Vorgang einer dunklen Grünfärbung mit voller Deckkraft.\\ Der Nachweischarakter des Smoke Tests ergibt sich daraus, dass eine rein 2D-basierte Implementierung die obigen Schritte 4 und 5 nicht ausführen kann. Erst durch \code{SUBMIT\_3D} und dem \code{flush()} wird sichtbar, dass der Host den 3D-Command-Stream akzeptiert und verarbeitet.
+
+
+\section{Resize-Unterstützung}
+
+Die Resize-Unterstützung erfordert, dass der bestehende Framebuffer-Zustand beim Wechsel der Auflösung konsistent abgebaut und anschließend mit den neuen Parametern neu aufgebaut wird. Ursache ist, dass die Framebuffer-Ressource (\code{RESOURCE\_ID\_FB}) im Treiber mit einer festen Resource-ID (\code{0xbabe}) erzeugt wird, während sich bei einer Auflösungsänderung sowohl Größe als auch Backing-Speicher ändern. Ein erneuter Aufbau ohne vorherigen Abbau kann dazu führen, dass der Host eine erneute Erstellung einer bereits existierenden Resource-ID ablehnt.
+
+Die verwendete virtio-drivers-Basis stellt die relevanten Kommando-IDs für das Entfernen des Backings und das Freigeben einer Resource bereits bereit mit:
+
+\begin{itemize}
+ \item \code{RESOURCE\_DETACH\_BACKING} als Kommando \code{0x107}
+ \item \code{RESOURCE\_UNREF} als Kommando \code{0x102}
+\end{itemize}
+
+Damit war für die Resize-Funktionalität nicht notwendig, diese Kommandos neu zu definieren. Für die konkrete Nutzung im Request-Pfad mussten jedoch die zugehörigen Request-Strukturen ergänzt werden, um die Kommandos als vollständige Nachrichten an die Control-Queue senden zu können.
+
+\begin{codeblock}{gpu.rs}{Rust}
+  \begin{rustcode}
+#[repr(C)]
+#[derive(Debug, Immutable, IntoBytes, KnownLayout)]
+struct ResourceDetachBacking {
+    header: CtrlHeader,
+    resource_id: u32,
+    _padding: u32,
+}
+#[repr(C)]
+#[derive(Debug, Immutable, IntoBytes, KnownLayout)]
+struct ResourceUnref {
+    header: CtrlHeader,
+    resource_id: u32,
+    _padding: u32,
+}
+  \end{rustcode}
+\end{codeblock}
+
+Damit ist die technische Voraussetzung erfüllt, um im Resize-Fall den bisherigen 2D-Framebuffer korrekt zu lösen, bevor eine neue Resource erzeugt wird.
+
+Hierzu wird in \code{setup\_framebuffer()} zunächst geprüft, ob bereits ein Framebuffer existiert. Falls ja, wird der bestehende Zustand über \code{destroy\_framebuffer()} abgebaut. In diesem Zuge wird der Scanout gelöst, das Resource-Backing getrennt und die Resource referenzseitig freigegeben. Danach wird der interne Treiberzustand so aktualisiert, dass der zugehörige DMA-Puffer freigegeben werden kann.
+
+\begin{codeblock}{gpu.rs}{Rust}
+  \begin{rustcode}
+fn destroy_framebuffer(&mut self, rect_for_scanout: Rect) {
+    let _ = self.set_scanout(rect_for_scanout, SCANOUT_ID, 0);
+    let _ = self.resource_detach_backing(RESOURCE_ID_FB);
+    let _ = self.resource_unref(RESOURCE_ID_FB);
+
+    self.frame_buffer_dma = None;
+    self.rect = None;
+}
+  \end{rustcode}
+\end{codeblock}
+
+Ohne die beschriebene Cleanup-Routine tritt in der Konfiguration mit Ubuntu 25.10 als Host/Stack bei einem Resize reproduzierbar ein Host-seitiger Fehler auf, der sich in der Ausgabe als:
+
+\begin{terminalblock}
+  \begin{textcode}
+virtio_gpu_virgl_process_cmd: ctrl 0x101, error 0x1203
+  \end{textcode}
+\end{terminalblock}
+
+manifestiert. Aus Sicht der VirtIO-GPU-Kommandos deutet dies darauf hin, dass beim erneuten Framebuffer-Aufbau ein \code{RESOURCE\_CREATE\_2D} für eine Resource-ID abgesetzt wird, die aus Host-Sicht nicht in einem gültigen Zustand ist oder bereits existiert. Die Zuordnung von Kommando- und Fehlercode ist dabei konsistent mit den in Referenzimplementierungen dokumentierten Konstanten (\code{0x101} für \code{RESOURCE\_CREATE\_2D}, \code{0x1203} für \code{ERR\_INVALID\_RESOURCE\_ID}).
+
+Interessant ist, dass dieses Verhalten hostabhängig variiert. In einer WSL2-basierten Umgebung wurde beobachtet, dass der Resize auch ohne explizites \code{destroy\_framebuffer} funktioniert. Eine mögliche Erklärung ist, dass sich die beteiligten Host-Komponenten (QEMU-Version, virglrenderer, Grafik-Backend und deren Fehlerbehandlung) unterscheiden und dadurch unterschiedliche Toleranzen gegenüber erneut verwendeten Resource-IDs entstehen.
+
+\section{Demos: Kompatibilität und Synchronisation}
+
+Dieser Kapitelabschnitt basiert auf Änderungen an \path{\os\kernel\src\virtio_demo\rectangle_demo.rs}, die Änderungen sind auch analog übertragbar auf die \code{pong\_demo.rs}. Hintergrund der Änderungen ist insbesondere, dass der integrierte Treiber als generische Struktur VirtIOGpu<H, T> implementiert ist, wobei H für die HAL und T für den Transport steht. Treiberfunktionen wie \code{setup\_framebuffer} und \code{flush()} sind dabei als Methoden mit \code{\&mut self} definiert, beispielsweise:
+
+\begin{codeblock}{gpu.rs}{Rust}
+  \begin{rustcode}
+pub fn setup_framebuffer(&mut self) -> Result<&mut [u8]> { ... }
+  \end{rustcode}
+\end{codeblock}
+
+Aus dieser Methodensignatur folgt, dass parallele oder verschachtelte Zugriffe auf dieselbe Treiberinstanz kontrolliert werden müssen. In der Vorversion der Demo wurde ein direkter GPU-Zugriff über eine eigene, nicht generische Treiberabstraktion verwendet und es war kein Mutex-basiertes Zugriffskonzept erforderlich. Die neue Demo übergibt stattdessen eine Mutex-geschützte Treiberinstanz und führt GPU-Operationen in einem kritischen Abschnitt aus, um die erforderliche exklusive Mutabilität herzustellen.
+
+\begin{codeblock}{rectangle\_demo.rs}{Rust}
+  \begin{rustcode}
+pub fn rectangle_demo(gpu_mutex: &Mutex<VirtIOGpu<HalImpl, PciTransport>>) {
+    let (mut fb_ptr, mut fb_len, mut screen_width, mut screen_height) =
+        interrupts::without_interrupts(|| {
+            let mut gpu = gpu_mutex.lock();
+            let (w, h) = gpu.resolution().unwrap();
+            let buf = gpu.setup_framebuffer().unwrap();
+            (buf.as_mut_ptr(), buf.len(), w as usize, h as usize)
+        });
+    // ...
+}
+  \end{rustcode}
+\end{codeblock}
+
+Da dieselbe GPU-Instanz auch im Interruptpfad verwendet werden kann, ist es hier essenziell den kritischen Abschnitt durch \code{interrupts::without\_interrupts} zu schützen. Würde der Thread den Mutex halten und von einem GPU-Interrupt unterbrochen werden, schlüge der Versuch des Handlers, den Mutex mittels \code{try\_lock} zu akquirieren, fehl. Infolgedessen könnte der Handler den Interrupt hardwareseitig nicht bestätigen (Acknowledge). Nach Rückkehr aus dem Handler würde die CPU aufgrund des weiterhin anliegenden Signals den Interrupt sofort erneut auslösen. Dies führt zu einem „Interrupt Storm“, der eine starke Verlangsamung des Systems verursacht.
+
+Dabei ist entscheidend, dass diese kritischen Abschnitte bewusst so kurz wie möglich gehalten werden. Ziel ist, den \code{Mutex} schnell wieder freizugeben und Interrupts unmittelbar danach wieder zuzulassen, um Latenz und Nebenwirkungen auf andere Subsysteme zu minimieren. In der Praxis wird daher nur der minimale Treiberaufruf innerhalb des kritischen Abschnitts ausgeführt, während rechenintensive Arbeit wie Rendering-Schleifen, Pixelberechnungen oder Buffer-Manipulation außerhalb erfolgt.
+
+\begin{codeblock}{rectangle\_demo.rs}{Rust}
+  \begin{rustcode}
+interrupts::without_interrupts(|| {
+    let mut gpu = gpu_mutex.lock();
+    gpu.flush().expect("GPU flush failed");
+});
+  \end{rustcode}
+\end{codeblock}
+
+Dieses Vorgehen hat jedoch einen messbaren Nebeneffekt. Während \code{interrupts::}\\ \code{without\_interrupts} aktiv ist, sind auch Timer-Interrupts ausgesetzt. Da die Demo zur frames-per-second (FPS)-Berechnung \code{sys\_get\_system\_time()} verwendet und diese Zeitbasis direkt von periodischen Timer-Interrupts abhängt, kann dies die Messung verfälschen oder im Extremfall zu unplausiblen Ergebnissen führen. Aus diesem Grund ist bei der Implementierung darauf zu achten, dass Zeitmessungen für FPS-Berechnungen nicht innerhalb interruptfreier Abschnitte erfolgen und dass die interruptfreien Bereiche insgesamt kurz bleiben. Für die Evaluation wird dieses Verhalten berücksichtigt.\\
+\\
+Weiterhin wird in der aktualisierten Demo die Resize-Unterstützung implementiert. Dazu wird ein Konfigurationsereignis über ein Pending-Flag signalisiert und anschließend im normalen Game-Loop verarbeitet. Im Resize-Fall werden Auflösung und Framebuffer-Slice neu bezogen. Da sich die Framebuffer-Adresse nach einem Resize ändern kann, erzeugt die Demo den Graphics-Wrapper pro Iteration neu auf Basis des aktuellen Pointers.
+
+\begin{codeblock}{rectangle\_demo.rs}{Rust}
+  \begin{rustcode}
+if GPU_CONFIG_PENDING.swap(false, Ordering::Acquire) {
+    interrupts::without_interrupts(|| {
+        let mut gpu = gpu_mutex.lock();
+        if let Ok((w, h)) = gpu.resolution() {
+            screen_width = w as usize;
+            screen_height = h as usize;
+        }
+        if let Ok(buf) = gpu.setup_framebuffer() {
+            fb_ptr = buf.as_mut_ptr();
+            fb_len = buf.len();
+        }
+    });
+}
+  \end{rustcode}
+\end{codeblock}
+
+\begin{codeblock}{rectangle\_demo.rs}{Rust}
+  \begin{rustcode}
+// Create Graphics wrapper for the current frame
+// We do this every loop iteration because 'fb_ptr' might have changed.
+let stride = screen_width * 4;
+let fb_slice = unsafe { slice::from_raw_parts_mut(fb_ptr, fb_len) };
+let mut gfx = Graphics::new(fb_slice, screen_width, screen_height, stride);
+  \end{rustcode}
+\end{codeblock}
+

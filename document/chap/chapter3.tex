@@ -1,0 +1,484 @@
+\chapter{Architektur und Einbindung der VirtIO-Treiber}
+
+\section{Integrationskonzept und Anforderungen}
+
+Das Integrationskonzept dieser Arbeit basiert auf der Einbindung der Rust-Crate virtio-drivers als wiederverwendbare Treiberbasis. Die Crate kapselt dabei die VirtIO-spezifische Treiberlogik, während systemabhängige Aufgaben gezielt vom Betriebssystem bereitgestellt werden. Dadurch wird die Treiberintegration so gestaltet, dass zusätzliche VirtIO-Geräte später konsistent aktiviert und genutzt werden können, ohne für jedes Gerät eine vollständig eigenständige Implementierung entwickeln zu müssen.\\
+\\
+Die Kopplung zwischen Betriebssystem und Treiberbasis erfolgt über eine Hardware-Abstraktionsschicht (\textbf{HAL}). Diese Schicht stellt die für die Crate notwendigen Plattformfunktionen bereit und bildet sie auf vorhandene Kernel-Mechanismen ab. Dazu gehören insbesondere die Bereitstellung DMA-fähiger Speicherbereiche, die benötigten Adressübersetzungen sowie der Zugriff auf die vom VirtIO-Transport bereitgestellten Geräteregisterbereiche. Damit ergeben sich klare Anforderungen an die Integration: Speicherbereiche, die von VirtIO-Geräten genutzt werden, müssen in geeigneter Form allokiert, gemappt und über ihre Lebensdauer hinweg gültig gehalten werden. Zudem muss die HAL so implementiert werden, dass die von virtio-drivers erwarteten Sicherheitsinvarianten eingehalten werden, da Teile der Anbindung im unsafe-Kontext stattfinden \cite{VirtioDriversHalInfo}.\\
+\\
+Ein wesentliches architektonisches Detail ist dabei die Art der Einbindung. Anstatt die Crate als unveränderliche Abhängigkeit aus der Registry zu beziehen, wird sie in der \code{Cargo.toml} des Kernels (\path{\os\kernel\Cargo.toml}) über eine lokale Pfadreferenz eingebunden:
+
+\begin{codeblock}{Cargo.toml}{TOML}
+  \begin{rustcode}
+[dependencies]
+virtio = { package = "virtio-drivers", path = "../library/virtio-drivers" }
+  \end{rustcode}
+\end{codeblock}
+
+Dies ermöglicht direkte Modifikationen am Quellcode der Treiberbibliothek. Dieser Zugriff ist essenziell, um später (siehe Kapitel 4) fehlende Funktionalitäten wie die VirGL-Unterstützung direkt in den internen Modulen (\code{gpu.rs}) nachrüsten zu können, ohne die Treiberarchitektur zu umgehen.
+
+\clearpage
+
+\section{DMA-Speicherbereitstellung}
+
+Dieser Kapitelabschnitt basiert auf Änderungen an \path{\os\kernel\src\dma\mod.rs}, da der hierfür relevante Code dort verortet ist. Die in dieser Datei implementierte DMA-Schnittstelle wurde unverändert aus der Arbeit von Nikita Elrich übernommen und dient in dieser Arbeit als bestehende Grundlage für die Anbindung von virtio-drivers.
+
+Ziel der DMA-Abstraktion ist es, dem Treiber bzw. der eingebundenen Treiber-Crate zusammenhängende Speicherbereiche bereitzustellen, die vom VirtIO-Gerät direkt adressiert werden können. Diese Speicherbereiche werden insbesondere für gemeinsam genutzte Datenstrukturen wie Virtqueues sowie für Ein- und Ausgabepuffer benötigt.
+
+Der nachfolgende Quelltext zeigt den Aufbau der Dma-Struktur. Sie hält die physikalische Startadresse paddr, einen nicht-null virtuellen Zeiger vaddr sowie Verwaltungsinformationen zur Größe.
+\begin{codeblock}{mod.rs}{Rust}
+  \begin{rustcode}
+/// A DMA buffer allocated in physical memory and mapped into virtual address space.
+#[derive(Debug)]
+pub struct Dma {
+    paddr: PhysAddr,
+    vaddr: NonNull<u8>,
+    size: usize,
+    pages: usize,
+}
+  \end{rustcode}
+\end{codeblock}
+
+Die Allokation erfolgt seitenbasiert über eine Kernel-interne Frame-Allokation. Anschließend wird für den zugehörigen virtuellen Bereich ein geeignetes Page-Table-Flag-Set gesetzt. In der vorliegenden Implementierung wird der Bereich explizit als present, writable und uncached markiert. Das Deaktivieren des Caches ist dabei eine bewusste Designentscheidung, um den Zugriff eines Geräts auf denselben Speicherbereich nicht durch Cache-Effekte zu verfälschen und damit eine robuste DMA-Nutzung zu ermöglichen.
+
+Ein weiterer zentraler Punkt ist die Adressbildung im Kernel. In D3OS ist der Kernelbereich identitätsabgebildet, d. h. physikalische und virtuelle Adresse stimmen überein. Dadurch kann die virtuelle Adresse direkt aus der physikalischen Adresse konstruiert werden, was die Anbindung vereinfacht.
+
+\begin{codeblock}{mod.rs}{Rust}
+  \begin{rustcode}
+kernel_process.virtual_address_space.set_flags(
+    pages_range,
+    PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE,
+);
+// In D3OS, the kernel is identity-mapped: physical = virtual address.
+let vaddr = NonNull::new(paddr.as_u64() as *mut u8).expect("Invalid virtual address");
+  \end{rustcode}
+\end{codeblock}
+Für die Nutzung in Treiberpfaden stellt Dma anschließend einfache Zugriffsmethoden bereit. \code{paddr()} liefert die physikalische Adresse, während \code{vaddr(offset)} einen virtuellen Zeiger (mit Bounds-Check) auf eine Teilposition innerhalb des Puffers zurückgibt. Zusätzlich ermöglicht \code{raw\_slice()} die Erzeugung eines zusammenhängenden u8-Slices über die gesamte DMA-Region, der sich z. B. für das initiale Befüllen von Puffern oder das lineare Schreiben von Nutzdaten eignet.
+
+\clearpage
+
+\section{HAL-Anbindung}
+
+Dieser Kapitelabschnitt basiert auf der Implementierung der HAL-Schicht in \path{\os\kernel\src\hal.rs}. Die HAL bildet die Schnittstelle zwischen Kernel und der eingebundenen Treiberbasis virtio-drivers. Sie kapselt betriebssystemspezifische Funktionen, die für den Betrieb der VirtIO-Treiber erforderlich sind, insbesondere die Bereitstellung DMA-fähiger Speicherbereiche sowie die Abbildung zwischen physischen und virtuellen Adressen. Damit stellt sie eine zentrale Voraussetzung dar, um die Treiberlogik der Crate in die Systemumgebung einzubetten.\\
+\\
+Das HAL-Trait definiert dabei auch einen Safety-Vertrag für die Anbindung der Treiberbibliothek. Die Korrektheit der bereitgestellten Zeiger, die Lebensdauer von DMA-Puffern sowie Annahmen zur Aliasfreiheit können vom Compiler nicht überprüft werden und müssen daher durch die HAL-Implementierung gewährleistet werden. Entsprechend sind Teile der Schnittstelle als unsafe deklariert \cite{VirtioDriversHalInfo}.\\
+\\
+Die Methoden \code{dma\_alloc} und \code{dma\_dealloc} bilden die Schnittstelle zwischen virtio-drivers und der in Abschnitt 3.2 beschriebenen DMA-Speicherbereitstellung. Die HAL-Dokumentation fordert dabei, dass \code{dma\_alloc} zusammenhängende physische Seiten allokiert und nullt und einen \code{NonNull<u8>} zurückgibt, der gültig, seitenaligned ist und bis zur Freigabe nicht mit anderen Referenzen aliasiert. In der hier verwendeten Implementierung wird dafür die bestehende Dma-Abstraktion genutzt, die den DMA-tauglichen Speicherbereich kapselt.\\
+\\
+Der nachfolgende Quelltext zeigt den Kern von \code{dma\_alloc}. Ein Dma-Objekt wird erzeugt, die physische Adresse (paddr) und die zugehörige virtuelle Adresse (vaddr) werden extrahiert und anschließend wird das Objekt mittels \code{core::mem::forget} absichtlich nicht gedroppt. Dadurch bleibt der Speicher reserviert und die Freigabe wird auf \code{dma\_dealloc} verlagert. Dieses Vorgehen passt zum Interface von virtio-drivers, da die Crate die spätere Deallokation explizit über \code{dma\_dealloc} anstößt.
+
+\begin{codeblock}{hal.rs}{Rust}
+  \begin{rustcode}
+fn dma_alloc(pages: usize, _direction: BufferDirection) -> (PhysAddr, NonNull<u8>) {
+    let dma_buffer = Dma::new(pages);
+
+    let paddr = dma_buffer.paddr().as_u64() as PhysAddr;
+    let vaddr = dma_buffer.vaddr(0);
+
+    core::mem::forget(dma_buffer);
+    (paddr, vaddr)
+}
+  \end{rustcode}
+\end{codeblock}
+
+Die korrespondierende Freigabe erfolgt über \code{dma\_dealloc}. Gemäß Spezifikation ist diese Methode unsafe, da der Aufrufer garantieren muss, dass es sich genau um den zuvor von \code{dma\_alloc} gelieferten Speicherbereich handelt und dass pages, paddr und vaddr übereinstimmen. In der Implementierung wird aus paddr der Start-Frame bestimmt und anschließend der Frame-Bereich über das Frame-Subsystem freigegeben.
+
+\begin{codeblock}{hal.rs}{Rust}
+  \begin{rustcode}
+unsafe fn dma_dealloc(paddr: PhysAddr, _vaddr: NonNull<u8>, pages: usize) -> i32 {
+    let start_frame =
+        PhysFrame::from_start_address(x86_64::PhysAddr::new(paddr as u64)).unwrap();
+    let frame_range = x86_64::structures::paging::frame::PhysFrameRange {
+        start: start_frame,
+        end: start_frame + pages as u64,
+    };
+    crate::memory::frames::free(frame_range);
+    0
+}
+  \end{rustcode}
+\end{codeblock}
+
+Für den PCI-Transport muss virtio-drivers MMIO-Adressen aus BARs in eine für den Treiber nutzbare virtuelle Adresse übersetzen können. Die HAL-Dokumentation beschreibt hierfür \code{mmio\_phys\_to\_virt} und erlaubt optional Validierung der Region über paddr und size. Aufgrund des Identity Mappings ist hier die physische Adresse einfach als virtuelle zu interpretieren.
+
+\begin{codeblock}{hal.rs}{Rust}
+  \begin{rustcode}
+unsafe fn mmio_phys_to_virt(paddr: PhysAddr, _size: usize) -> NonNull<u8> {
+    NonNull::new(paddr as *mut u8).unwrap()
+}
+  \end{rustcode}
+\end{codeblock}
+
+Damit erfüllt die HAL-Schicht die zentrale Funktion als Adapter, sie stellt virtio-drivers die betriebssystemspezifischen Primitive zur Verfügung, insbesondere DMA-Allokation, (MMIO-)Adressierung und Speicherfreigabe. Auf dieser Grundlage kann im nächsten Abschnitt die Geräteinitialisierung über PCI sowie die Erzeugung und Bereitstellung konkreter Treiberinstanzen beschrieben werden.
+
+%\clearpage
+
+\section{Geräteinitialisierung}
+
+Dieser Kapitelabschnitt basiert auf Änderungen an \path{\os\kernel\src\boot.rs}, da dort die Erkennung von VirtIO-Geräten über PCI, das Mapping der Gerätespeicherbereiche sowie die initiale Treiberinstanziierung umgesetzt sind. Ziel des Initialisierungspfads ist es, VirtIO-Geräte beim Systemstart zuverlässig zu finden, die für den Zugriff notwendigen Ressourcen bereitzustellen und anschließend konkrete Treiberinstanzen zu erzeugen, die im weiteren Systemverlauf genutzt werden können.\\
+\\
+Damit der folgende Code funktioniert und VirtIO-Geräte gefunden werden, müssen entsprechende VirtIO-Geräte in der QEMU-Startkonfiguration aktiviert sein. Andernfalls liefert die PCI-Enumeration zwar weiterhin alle vorhandenen Geräte, es existieren jedoch keine Einträge mit der VirtIO \textbf{Vendor-ID} \code{0x1AF4}. In der verwendeten \code{Makefile.toml} werden die für diese Arbeit relevanten Geräte daher explizit hinzugefügt, z. B. für die VirtIO-GPU und VirtIO-Sound:
+
+\begin{codeblock}{Makefile.toml}{TOML}
+  \begin{rustcode}
+# VirtIO GPU
+"-device", "virtio-vga-gl"
+#VirtIO Sound
+"-device", "virtio-sound-pci,audiodev=audio0"
+  \end{rustcode}
+\end{codeblock}
+
+
+\subsection{VirtIO-Erkennung}
+
+Die Suche nach VirtIO-Geräten erfolgt über den PCI-Bus anhand der VirtIO Vendor-ID \code{0x1AF4}. Für jedes gefundene Gerät wird zunächst eine DeviceFunction erzeugt, die den eindeutigen PCI-Ort (Bus/Device/Function) beschreibt.
+
+\begin{codeblock}{boot.rs}{Rust}
+  \begin{rustcode}
+const VIRTIO_VENDOR_ID: u16 = 0x1AF4;
+
+let virtio_devices = pci_bus.search_by_vendor(VIRTIO_VENDOR_ID);
+let mut pci_root = PciRoot::new(unsafe { pci_config_space.unsafe_clone() });
+
+for device_lock in virtio_devices.iter() {
+    let address = device_lock.read().header().address();
+
+    let device_function = DeviceFunction {
+        bus: address.bus(),
+        device: address.device(),
+        function: address.function(),
+    };
+    // ...
+}
+  \end{rustcode}
+\end{codeblock}
+
+Zur technischen Umsetzung der Erkennung wurde die PciBus-Struktur in \path{\os\kernel\src\device\pci.rs} um die Hilfsmethode \code{search\_by\_vendor} erweitert. Diese iteriert über alle beim Systemstart enumerierten PCI-Geräte und filtert diese anhand der Vendor-ID, wodurch eine effiziente Selektion der relevanten VirtIO-Geräte ermöglicht wird.
+
+\begin{codeblock}{pci.rs}{Rust}
+  \begin{rustcode}
+pub fn search_by_vendor(&self, vendor_id: u16) -> Vec<&RwLock<EndpointHeader>> {
+    self.devices
+        .iter()
+        .filter(|device| device.read().header().id(self.config_space()).0 == vendor_id)
+        .collect()
+}
+  \end{rustcode}
+\end{codeblock}
+
+Damit die instanziierten VirtIO-Treiber anschließend Zugriff auf den PCI-Kon\-fi\-gu\-ra\-ti\-ons\-raum erhalten, muss zudem eine Schnittstellenkompatibilität zwischen dem Kernel-eigenen PCI-Subsystem und der externen VirtIO-Bibliothek hergestellt werden. Hierfür implementiert die Struktur \code{ConfigurationSpace} den Trait \code{VirtioConfigAccess}. Diese Implementierung fungiert als Adapter-Schicht, sie übersetzt die adressierungs- und zugriffsspezifischen Typen der VirtIO-Bibliothek (z.B. DeviceFunction) in die internen Datenstrukturen des Betriebssystems (\code{PciAddress}) und leitet Lese- und Schreibzugriffe an die bestehende \code{ConfigRegionAccess}-Logik weiter.
+
+\begin{codeblock}{pci.rs}{Rust}
+  \begin{rustcode}
+impl VirtioConfigAccess for ConfigurationSpace {
+    fn read_word(&self, device_function: virtio::transport::pci::bus::DeviceFunction, register_offset: u8) -> u32 {
+        let address = PciAddress::new(0, device_function.bus, device_function.device, device_function.function);
+        unsafe { self.read(address, register_offset as u16) }
+    }
+
+    fn write_word(&mut self, device_function: virtio::transport::pci::bus::DeviceFunction, register_offset: u8, data: u32) {
+        let address = PciAddress::new(0, device_function.bus, device_function.device, device_function.function);
+        unsafe { self.write(address, register_offset as u16, data) };
+    }
+    
+    unsafe fn unsafe_clone(&self) -> Self {
+        self.clone()
+    }
+}
+  \end{rustcode}
+\end{codeblock}
+
+\subsection{BAR-Mapping}
+
+Damit virtio-drivers später über den PCI-Transport auf die relevanten Registerbereiche zugreifen kann, müssen die entsprechenden BAR-Regionen im Kerneladressraum verfügbar sein. Dazu iteriert der Boot-Code über die BAR-Einträge des Geräts und mappt geeignete Speicherbereiche als Device Memory.\\
+Wichtig ist dabei, dass PCI 64-Bit Memory-BARs zwei BAR-Registerplätze belegen (Low- und High-DWORD, z. B. BAR2 und BAR3) \cite{VirtioDriversBarInfo}. Der nachfolgende BAR-Slot enthält somit keine eigenständige BAR, sondern lediglich das obere 32-Bit-Wort der bereits ausgewerteten 64-Bit-Adresse. Dieser Eintrag wird daher bewusst übersprungen, um zu vermeiden, dass das High-DWORD fälschlich als separate BAR interpretiert wird
+
+\begin{codeblock}{boot.rs}{Rust}
+  \begin{rustcode}
+for bar_index in 0..6 {
+    if let Ok(Some(BarInfo::Memory { address, size, .. })) =
+        pci_root.bar_info(device_function, bar_index)
+    {
+        if size == 0 {
+            continue;
+        }
+        if address % PAGE_SIZE as u64 != 0 {
+            warn!("Skipping non-page-aligned 64-Bit Bar{} at {:#x}", bar_index, address);
+            continue;
+        }
+        // ...
+    }
+}
+  \end{rustcode}
+\end{codeblock}
+
+Im Rahmen der BAR-Auswertung wird geprüft, ob ein zu mappender Gerätespeicherbereich mit dem bereits durch Multiboot bereitgestellten Framebufferbereich überlappt. Diese Situation tritt in der verwendeten Konfiguration auf, da die virtuelle GPU in QEMU über die Geräteoption \code{-device virtio-vga-gl} eingebunden wird und dadurch der VGA-Framebuffer physikalisch an derselben Basisadresse beginnt wie der Multiboot-Framebuffer. In diesem Fall wird auf ein erneutes Mapping verzichtet, stattdessen wird das vorhandene Framebuffer-Mapping wiederverwendet und um den zusätzlichen Adressbereich erweitert. Dadurch bleibt der Bootvorgang unabhängig von der konkreten Gerätekonfiguration korrekt, also sowohl mit als auch ohne VirtIO-GPU als VGA-Gerät.
+
+\begin{codeblock}{boot.rs}{Rust}
+  \begin{rustcode}
+#[inline(always)]
+const fn overlaps(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
+    !(a_end <= b_start || b_end <= a_start)
+}
+  \end{rustcode}
+\end{codeblock}
+
+\begin{codeblock}{boot.rs}{Rust}
+  \begin{rustcode}
+if overlaps(bar_start, bar_end, fb_start_phys_addr, fb_end_phys_addr) {
+    // Bereits gemappter Multiboot-LFB (virtio-vga BAR0) 
+    info!(
+        "BAR{} {:#x}..{:#x} overlaps framebuffer {:#x}..{:#x},
+        bar_index, bar_start, bar_end, fb_start_phys_addr, fb_end_phys_addr
+    );
+    let fb_end_aligned = PhysAddr::new(fb_end_phys_addr).align_up(PAGE_SIZE as u64).as_u64();
+
+    if bar_end > fb_end_aligned {
+        let tail_start = fb_end_aligned;
+        let tail_end = bar_end;
+
+        let tail_size = tail_end - tail_start; // Für Terminalausgabe
+
+        info!("Mapping BAR{} tail at {:#x} (size: {:#x})", bar_index, tail_start, tail_size);
+
+        let kernel_process = process_manager().read().kernel_process().unwrap();
+        kernel_process.virtual_address_space.kernel_map_devm_identity(
+            tail_start,
+            tail_end,
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE,
+            VmaType::DeviceMemory,
+            "virtio-gpu-vram-tail",
+        );
+    }
+    continue;
+}
+// Kein Overlap -> normales Mapping per address und address + size
+..
+  \end{rustcode}
+\end{codeblock}
+
+Die Verwendung von NO\_CACHE ist hier eine typische Maßnahme für MMIO-/Device-Memory-Abbildungen, um unerwünschte Cache-Effekte bei Registerzugriffen zu vermeiden. Wenn kein Overlap gefunden wurde, weil die VirtIO-GPU z.B. mit \code{-device virtio-}\\ \code{gpu-pci} angebunden wurde und somit nicht als VGA-Gerät fungiert, wird das BAR normal gemapped.
+
+\begin{terminalblock}
+  \begin{textcode}
+[INF][boot.rs@303] BAR0 0x80000000..0x80800000 overlaps framebuffer 0x80000000..0x801d4c00
+[INF][boot.rs@315] Mapping BAR0 tail at 0x801d5000 (size: 0x62b000)
+...
+[INF][vmm.rs@333] (VirtAddr(0x80000000), VMA: Space: Kernel, Type: DeviceMemory, [0x80000000; 0x801d5000], #pages: 469, tag: "framebuffer-----")
+[INF][vmm.rs@333] (VirtAddr(0x801d5000), VMA: Space: Kernel, Type: DeviceMemory, [0x801d5000; 0x80800000], #pages: 1579, tag: "virtio-gpu-vram-")
+  \end{textcode}
+\end{terminalblock}
+
+Anhand der Terminalausgabe kann man erkennen, dass der LFB-Framebuffer wiederverwendet wurde und der VirtIO-GPU-Framebuffer den vollen Speicher von 0x80000000 bis 0x80800000 belegt.
+
+\subsection{Aktivierung und Interrupt-Anbindung}
+
+Nach dem Mapping werden im Bootpfad die nötigen PCI-Command-Bits gesetzt, sodass das Gerät Bus Mastering und Memory/IO-Zugriffe nutzen darf. Anschließend wird die hardwareseitige Interrupt-Line ausgelesen. Um Konflikte mit den für CPU-Exceptions reservierten Vektoren (0–31) zu vermeiden, erfolgt eine Abbildung auf den benutzerdefinierbaren Bereich durch Addition eines Offsets von 32. Der resultierende Interrupt-Vektor wird im System registriert und dem VirtIO-Treiber zugewiesen.
+
+\begin{codeblock}{boot.rs}{Rust}
+  \begin{rustcode}
+if let Some(mut device_writer) = device_lock.try_write() {
+    device_writer.update_command(pci_bus.config_space(), |cmd| {
+        cmd | pci_types::CommandRegister::BUS_MASTER_ENABLE
+            | pci_types::CommandRegister::MEMORY_ENABLE
+            | pci_types::CommandRegister::IO_ENABLE
+    });
+
+    let (_, interrupt_line) = device_writer.interrupt(pci_bus.config_space());
+    if interrupt_line != 0 && interrupt_line != 0xFF {
+        let interrupt_vector = InterruptVector::try_from(interrupt_line + 32).unwrap();
+        interrupt_dispatcher().assign(interrupt_vector, Box::new(VirtioInterruptHandler));
+        apic().allow(interrupt_vector);
+    }
+}
+  \end{rustcode}
+\end{codeblock}
+
+Damit ist die Grundlage geschaffen, Geräteereignisse später zu verarbeiten. Die eigentliche Logik der Interruptbehandlung wird im separaten Abschnitt zum VirtIO-Interrupt-Handler erläutert.
+
+\subsection{Treiberinstanzen und zentrale Bereitstellung}
+
+Im letzten Schritt wird aus der PCI-Device\_function ein PciTransport erzeugt und anhand des Gerätetyps der passende Treiber instanziiert. Die Treiberinstanzen werden über ein einmaliges Initialisierungsmuster \code{call\_once} erzeugt und anschließend zentral gehalten, typischerweise in Kombination mit einem \code{Mutex} zur Synchronisation.
+
+\begin{codeblock}{boot.rs}{Rust}
+  \begin{rustcode}
+match PciTransport::new::<HalImpl, _>(&mut pci_root, device_function) {
+    Ok(mut transport) => {
+        match transport.device_type() {
+            virtio::transport::DeviceType::GPU => {
+                VIRTIO_GPU.call_once(|| {
+                    Mutex::new(
+                        VirtIOGpu::<HalImpl, PciTransport>::new(transport)
+                            .expect("Failed to create VirtIO GPU driver")
+                    )
+                });
+            }
+            virtio::transport::DeviceType::Sound => {
+                VIRTIO_SOUND.call_once(|| {
+                    Mutex::new(
+                        VirtIOSound::<HalImpl, PciTransport>::new(transport)
+                            .expect("Failed to create VirtIO Sound driver")
+                    )
+                });
+            }
+            // weitere Gerätetypen analog
+            dt => {
+                warn!("Unbehandelter Typ: {:?}", dt);
+            }
+        }
+    }
+    Err(e) => error!("Fehler: {:?}", e),
+}
+  \end{rustcode}
+\end{codeblock}
+
+Damit ist der Bootpfad so aufgebaut, dass VirtIO-Geräte erkannt, ihre Ressourcen gemappt, Interrupts angebunden und Treiberinstanzen reproduzierbar bereitgestellt werden. Auf dieser Grundlage können anschließend die gerätespezifischen Funktionalitäten (VirtIO-GPU inkl. Resize/VirGL und VirtIO-Sound) genutzt und in der Evaluation verglichen werden.
+
+\section{Interrupt- und Event-Anbindung}
+
+Dieser Kapitelabschnitt basiert auf Änderungen an \path{\os\kernel\src\interrupt\virtio_handler.rs}, da dort die zentrale Behandlung von VirtIO-bezogenen Interrupts implementiert ist. Ziel dieses Handlers ist es, Geräteinterrupts zuverlässig zu quittieren und Ereignisse so zu signalisieren, dass die eigentliche Verarbeitung außerhalb des Interrupt-Kontexts erfolgen kann. Dadurch bleibt der Interruptpfad kurz und deterministisch, während komplexere Logik in regulären Ausführungskontexten abgearbeitet wird.
+
+Die Implementierung erfolgt über eine Struktur \code{VirtioInterruptHandler}, die das systeminterne InterruptHandler-Interface implementiert. Der Einstiegspunkt ist die Methode \code{trigger()}. Innerhalb dieser Methode werden die jeweils initialisierten Virt\-IO-Ge\-rä\-te\-in\-stan\-zen abgefragt und nicht-blockierend über \code{try\_lock()} gelockt. Das nicht-blockierende Locking reduziert das Risiko, im Interrupt-Kontext in Wartezustände zu geraten, und verhindert damit unnötige Latenz oder potenzielle Verklemmungen.\\
+\\
+Für jedes Gerät wird zunächst der Treiber gelockt, anschließend wird der Interrupt über \code{ack\_interrupt()} quittiert und bei Bedarf eine minimale Signalisierung ausgelöst.
+
+\begin{codeblock}{virtio\_handler.rs}{Rust}
+  \begin{rustcode}
+pub struct VirtioInterruptHandler;
+
+impl InterruptHandler for VirtioInterruptHandler {
+    fn trigger(&self) {
+        // GPU Handler
+        if let Some(gpu) = virtio_gpu() {
+            if let Some(mut g) = gpu.try_lock() {
+                let st = g.ack_interrupt();
+                // ...
+            }
+        }
+        // Sound Handler
+        if let Some(sound_dev) = virtio_sound() {
+            if let Some(mut sound_driver) = sound_dev.try_lock() {
+                let status = sound_driver.ack_interrupt();
+            }
+        }
+        // Socket Handler - nutzt polling
+    }
+}
+  \end{rustcode}
+\end{codeblock}
+
+Für die Grafikunterstützung ist nicht nur das Quittieren des Interrupts relevant, sondern auch die Unterscheidung verschiedener Ursachen. VirtIO signalisiert beispielsweise \textbf{Queue-Interrupts} (abgeschlossene Queue-Aktivität) und \textbf{Konfigurationsinterrupts} (Gerätekonfigurationsänderungen). Die Implementierung wertet hierzu den zurückgegebenen \code{InterruptStatus} aus und setzt atomare Pending-Flags. Diese Flags dienen als Übergabemechanismus an nachgelagerte Verarbeitungsschritte, ohne dass im Interrupt-Kontext umfangreiche Arbeit durchgeführt werden muss.\\
+\code{GPU\_QUEUE\_PENDING} markiert dabei Queue-Ereignisse, \code{GPU\_CONFIG\_PENDING} markiert Konfigurationsänderungen, die insbesondere für Resize-Unterstützung relevant sind.
+
+\begin{codeblock}{virtio\_handler.rs}{Rust}
+  \begin{rustcode}
+// ... GPU Handler
+let st = g.ack_interrupt();
+
+if st.contains(InterruptStatus::QUEUE_INTERRUPT) {
+    GPU_QUEUE_PENDING.store(true, Ordering::Release);
+}
+if st.contains(InterruptStatus::DEVICE_CONFIGURATION_INTERRUPT) {
+    GPU_CONFIG_PENDING.store(true, Ordering::Release);
+}
+  \end{rustcode}
+\end{codeblock}
+
+Damit wird eine klare Trennung erreicht: Der Interrupt-Handler reduziert sich auf das Quittieren des Interrupts und das Setzen minimaler Zustandsindikatoren. Die eigentliche Bearbeitung, etwa das Abholen fertiggestellter Queue-Operationen oder das Reagieren auf Konfigurationsänderungen, kann anschließend in einem passenden Ausführungskontext erfolgen.\\
+\\
+Analog zur GPU werden auch weitere VirtIO-Geräte im Handler quittiert. Für VirtIO-Sound wird der Interrupt ebenfalls per \code{ack\_interrupt()} bestätigt und protokolliert. Dieses Schema lässt sich generisch auf weitere Geräte übertragen, die eine hardwareseitige Quittierung erfordern. Ausgenommen hiervon sind lediglich Treiberkomponenten, die entwurfsbedingt auf Interrupts verzichten. Ein Beispiel hierfür ist der VirtIO-Socket-Treiber, der stattdessen Polling verwendet. Dadurch bleibt der Handler modular erweiterbar, ohne den grundlegenden Pfad für interrupt-gesteuerte Geräte zu verändern.
+
+\section{Globales Zugriffskonzept}
+
+Dieser Kapitelabschnitt basiert auf Änderungen an \path{\os\kernel\src\lib.rs}, da dort die zentralen, global verfügbaren Treiberinstanzen sowie die zugehörigen Zugriffsfunktionen definiert sind. Die in Abschnitt 3.4 initialisierten VirtIO-Treiber sollen im weiteren Systemverlauf von unterschiedlichen Komponenten genutzt werden können, etwa von Demonstrationsprogrammen, von Interruptpfaden sowie von höherliegenden Subsystemen. Dafür wird ein globales Zugriffskonzept verwendet, das eine einmalige Initialisierung sicherstellt und gleichzeitig kontrollierten, synchronisierten Zugriff ermöglicht.
+
+Die Treiberinstanzen werden als globale, statisch lebende Strukturen gehalten. Zur Gewährleistung einer einmaligen Initialisierung wird hierfür ein \code{Once}-Mechanismus eingesetzt. Jede Treiberinstanz wird zusätzlich durch ein \code{Mutex} geschützt, sodass auch bei konkurrierenden Zugriffen ein konsistenter Zustand gewährleistet bleibt.
+
+\begin{codeblock}{lib.rs}{Rust}
+  \begin{rustcode}
+static CPU: Once<Cpu> = Once::new();
+
+static VIRTIO_RNG:   Once<Mutex<VirtIORng<HalImpl, PciTransport>>>   = Once::new();
+static VIRTIO_GPU:   Once<Mutex<VirtIOGpu<HalImpl, PciTransport>>>   = Once::new();
+static VIRTIO_SOUND: Once<Mutex<VirtIOSound<HalImpl, PciTransport>>> = Once::new();
+
+pub static GPU_QUEUE_PENDING:  AtomicBool = AtomicBool::new(false);
+pub static GPU_CONFIG_PENDING: AtomicBool = AtomicBool::new(false);
+  \end{rustcode}
+\end{codeblock}
+
+Die zusätzlichen atomaren Statusvariablen dienen der Ereignissignalisierung aus dem Interrupt-Kontext. Wie in Abschnitt 3.5 gezeigt, werden sie durch den Interrupt-Handler gesetzt und anschließend außerhalb des Interrupt-Kontexts ausgewertet. Damit bleibt der Interruptpfad kurz, während die eigentliche Verarbeitung im regulären Ausführungskontext erfolgt.
+
+Um den Zugriff auf die Treiberinstanzen zu vereinheitlichen, werden Getter-Funktionen bereitgestellt. Diese kapseln die globale Ablage und liefern bei erfolgreicher Initialisierung eine Referenz auf das jeweilige \code{Mutex}-geschützte Treiberobjekt.\\
+Der Rückgabewert ist jeweils Option, da eine Treiberinstanz nur dann verfügbar ist, wenn sie im Boot-Prozess tatsächlich initialisiert wurde. Dadurch bleibt das System robust gegenüber Konfigurationen, in denen bestimmte VirtIO-Geräte nicht vorhanden sind.
+
+\begin{codeblock}{lib.rs}{Rust}
+  \begin{rustcode}
+pub fn virtio_gpu() -> Option<&'static Mutex<VirtIOGpu<HalImpl, PciTransport>>> {
+    VIRTIO_GPU.get()
+}
+pub fn virtio_sound() -> Option<&'static Mutex<VirtIOSound<HalImpl, PciTransport>>> {
+    VIRTIO_SOUND.get()
+}
+// Möglichkeit für weitere Devices
+  \end{rustcode}
+\end{codeblock}
+
+Dieses Muster erfüllt zwei Ziele, erstens wird die Initialisierung semantisch klar vom Zugriff getrennt. Zweitens wird der Umgang mit optional vorhandenen Geräten zentral geregelt, sodass aufrufende Komponenten keinen direkten Zugriff auf globale Variablen benötigen und die Abhängigkeiten transparent bleiben.
+
+Das Singleton- und Zugriffskonzept bildet den verbindenden Baustein zwischen den zuvor beschriebenen Teilen. Die Initialisierung in \code{boot.rs} erzeugt die Treiberinstanzen einmalig und legt sie in den globalen \code{Once}-Containern ab. Der Interrupt-Handler nutzt die Getter-Funktionen, um vorhandene Geräte nicht-blockierend zu locken, und Interrupts zu quittieren. Höherliegende Komponenten, wie die Grafik- und Audio-Demos, greifen über dieselben Getter-Funktionen auf die Treiber zu und profitieren dadurch von einem einheitlichen Zugriffspfad.
+
+\section{VirtIO-Sound und Beispielanwendung}
+
+Neben der Grafikunterstützung wurde in dieser Arbeit auch VirtIO-Sound angebunden, um eine einfache Audioausgabe in D3OS zu ermöglichen. Ziel ist dabei nicht die vollständige Abdeckung aller Features der VirtIO-Sound-Spezifikation, sondern eine minimal funktionsfähige PCM-Playback-Pipeline, die als Nachweis dient, dass die integrierte Treiberbasis auch zeitkontinuierliche Datenströme (Audio) zuverlässig bedienen kann.
+
+\subsubsection{Treiberaufbau und Queues}
+
+Der VirtIO-Sound-Treiber folgt, analog zu anderen VirtIO-Geräten, dem üblichen Modell aus Konfigurationsraum, Feature-Negotiation und mehreren Virtqueues. Beim Initialisieren werden aus dem Konfigurationsraum die verfügbaren Jacks, Streams und Channel Maps gelesen. Anschließend werden vier Queues aufgebaut:
+
+\begin{itemize}
+ \item Control-Queue: Austausch von Kontrollnachrichten (z. B. Abfrage von Stream-Informationen, Setzen von Parametern, Start/Stop).
+ \item Event-Queue: Ereignisse/Benachrichtigungen des Geräts (z. B. Period-Notifications).
+ \item TX-Queue: Übertragung von PCM-Daten vom Gast zum Host (Playback).
+ \item RX-Queue: Empfangspfad (z. B. Capture); in dieser Arbeit nicht weiter genutzt.
+\end{itemize}
+
+Der Treiber kapselt diese Queues in einer Instanz und stellt darauf aufbauend eine kompakte PCM-API bereit. Diese umfasst Funktionen wie \code{pcm\_set\_params}, \code{pcm\_prepare}, \code{pcm\_start}, \code{pcm\_xfer}, \code{pcm\_stop} und \code{pcm\_release}. Zur Fähigkeitserkennung werden zusätzlich die pro Stream unterstützten Raten, Formate und Kanalbereiche aus den PCM-Infos extrahiert.\\
+
+\subsubsection{PCM-Parameter}
+
+Für den PCM-Betrieb sind insbesondere zwei Parameter entscheidend:
+
+\begin{itemize}
+ \item \code{period\_bytes}: Größe eines einzelnen Audioblocks (eine „Periode“), der in einem Transfer übergeben wird.
+ \item \code{buffer\_bytes}: Größe des Ringpuffers im Gerät, typischerweise ein Vielfaches der Periodengröße.
+\end{itemize}
+
+Der Treiber validiert dabei, dass \code{period\_bytes > 0}, \code{period\_bytes <= buffer\_bytes} und \code{buffer\_bytes \% period\_bytes == 0}. Diese Constraints spiegeln die Erwartung wider, dass das Gerät periodisch konsumiert und die Transfers in periodengroße Blöcke zerlegt werden. In der Testanwendung wird außerdem darauf geachtet, dass \code{period\_bytes} frame-aligned ist, also durch die Framegröße (Bytes pro Sample × Kanalanzahl) teilbar bleibt. Dadurch wird verhindert, dass Transfers mitten in einem Sample-Frame enden.
+
+\subsubsection{Blocking vs. Non-Blocking Transfer}
+
+Für das Senden von Audiodaten existieren zwei Varianten:
+
+\begin{itemize}
+ \item \code{pcm\_xfer}(blocking): zerlegt den Eingabepuffer in Perioden und hält die TX-Queue so lange gefüllt, bis alle Blöcke abgespielt wurden. Die Verarbeitung der Completions erfolgt über \code{pop\_used}, sodass der Aufrufer blockiert, bis die Wiedergabe abgeschlossen ist.
+ \item \code{pcm\_xfer\_nb}(non-blocking): übergibt genau eine Periode und gibt sofort ein Token zurück. Der Treiber behält die zugehörigen Buffer/Statusstrukturen intern, bis der Aufrufer später mit \code{pcm\_xfer\_ok}(token) die Completion quittiert. Dieses Modell erlaubt es, mehrere Perioden „in flight“ zu halten, und damit eine kontinuierliche Wiedergabe ohne lange kritische Abschnitte zu realisieren.
+\end{itemize}
+
+Gerade in einem Bare-Metal-Kontext ist der non-blocking Pfad nützlich, weil er eine feinere Kontrolle über Scheduling und Synchronisation ermöglicht: Statt eine große Transferfunktion zu blockieren, kann die Anwendung periodisch Tokens einsenden und completete Transfers nachziehen.
+
+\subsubsection{Beispielanwendung}
+
+Zur Demonstration wurde die Funktion \code{play\_pcm\_file()}, welche über die \code{boot.rs} aufgerufen wird und sich in \path{os\kernel\src\virtio_demo\virtio_tests} befindet, implementiert. Sie stellt einen minimalen Audioplayer dar, der eine PCM-Datei zur Kompilierzeit über das Makro (\code{include\_bytes!(...)}) einbettet und diese anschließend über VirtIO-Sound ausgibt. Der Ablauf ist in mehrere Phasen gegliedert:
+
+\begin{enumerate}
+ \item Abfrage der Gerätefähigkeiten: Zunächst wird ein Output-Stream bestimmt und die unterstützten Sample-Raten, Formate und Kanalbereiche gelesen. Daraus werden Zielparameter abgeleitet (mit einfachen Fallbacks, falls z. B. 44.1 kHz oder S16 nicht verfügbar sind).
+ \item Konfiguration des Streams: Mit \code{pcm\_set\_params} werden Buffer- und Periodengröße sowie Kanalzahl, Format und Rate gesetzt. Darauf folgen \code{pcm\_prepare} und \code{pcm\_start}.
+ \item Streaming der PCM-Daten: Die PCM-Daten werden in periodengroße Blöcke geschnitten und mittels \code{pcm\_xfer\_nb} eingereiht. Um eine stabile Wiedergabe zu erreichen, hält die Implementierung ein kleines „In-Flight-Fenster“ (mehrere Perioden gleichzeitig in der Queue). Parallel dazu werden
+ \begin{itemize}
+ \item Benachrichtigungen aus der Event-Queue abgeholt (sofern vorhanden) und
+ \item fertige Transfers über \code{pcm\_xfer\_ok(token)} aus dem Used-Ring entfernt.
+\end{itemize}
+ \item Aufräumen: Nach Abschluss werden \code{pcm\_stop} und \code{pcm\_release} aufgerufen
+\end{enumerate}
+
+Ein weiterer zentraler Implementierungsaspekt ist die Locking-Strategie. Analog zur in Abschnitt 4.4 beschriebenen Problematik bei der Grafikdarstellung erfordert auch der Audio-Treiber Zugriffsschutz durch Mutex-Sperren. Deshalb minimiert \code{play\_pcm\_file()} die Lockdauer bewusst. Geräteabfragen und Kontrolloperationen erfolgen in kurzen Lock-Abschnitten, während die eigentliche Parameterauswahl und Chunk-Aufteilung ohne Lock stattfinden. Dadurch wird vermieden, dass längere Audiooperationen das System unnötig blockieren.

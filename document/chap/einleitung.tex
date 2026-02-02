@@ -1,32 +1,69 @@
 \chapter{Einleitung}
 
-Nachfolgend einige Punkte, die es zu beachten gilt:
-\begin{enumerate}
- \item Dieses Template dient als Vorlage, damit diverse Anforderungen wie allgemeines Layout der Arbeit,
-       Formatierung etc. einheitlich sind. Weiterhin bietet es einen etwas leichteren Einstieg in LaTeX
-       und sollte somit nicht zu viel Zeit in Anspruch nehmen, damit die eigentliche Arbeit nicht darunter leidet.
- \item Einzelne Kapitel dieser Vorlage geben einige grundlegende Konstrukte vor, die zum größten Teil per
-       Copy/Paste übernommen werden können. Dennoch ist es unvermeidbar, sich mit LaTeX (bis zu einem
-       gewissen Maß) zu beschäftigen. Mit Google kann man die meisten Probleme sehr leicht lösen und
-       bekommt oft direkt den passenden Code geliefert.
-\end{enumerate}
+Die Entwicklung von Betriebssystemen findet heute häufig in virtualisierten Umgebungen statt. Virtuelle Maschinen ermöglichen reproduzierbare Testaufbauten, vereinfachen Debugging und erlauben es, neue Kernel-Funktionen unabhängig von konkreter physischer Hardware zu evaluieren. Gerade bei Forschungs- und Lehrbetriebssystemen ist diese Reproduzierbarkeit wichtig, weil sie Experimente, automatisierte Tests und die Zusammenarbeit im Team erleichtert.
+
+In diesem Umfeld hat sich \textbf{VirtIO} als zentraler Baustein etabliert. VirtIO beschreibt eine Familie paravirtualisierter Geräte, die speziell dafür entworfen wurden, in virtuellen Maschinen effizient bereitgestellt und genutzt zu werden. Statt komplexe “klassische” Hardware (z. B. Netzwerkkarten oder Grafikkartenmodelle) vollständig zu emulieren, stellt der Hypervisor standardisierte VirtIO-Geräte zur Verfügung, die vom Gast über einen klar definierten Mechanismus angesprochen werden. Die Spezifikation ist als offener Standard bei OASIS organisiert.
+
+Im Kontext dieser Arbeit steht \textbf{D3OS} (Distributed Data-Driven OS), ein am Lehrstuhl entwickeltes, Rust-basiertes verteiltes Betriebssystem, das auf skalierbares Big-Data-Com\-pu\-ting auf moderner Rechenzentrums-Hardware abzielt. D3OS verfolgt dabei den Anspruch, Betriebssystemdesign stärker an die Anforderungen datengetriebener Workloads und aktueller Hardwarelandschaften anzupassen \cite{hhu_hermes}.
+
+Für D3OS löst VirtIO ein praktisches Kernproblem: Ohne eine solche Standard"=Schnittstelle müsste ein Lehr- und Forschungsbetriebssystem entweder viele hardware-spezifische Treiber selbst entwickeln und warten, oder auf weniger geeignete/ineffizientere Emulationsmodelle ausweichen. Beides erhöht die Komplexität stark und bindet Entwicklungszeit an Peripherie-Themen, statt an den eigentlichen OS-Fragestellungen. VirtIO fungiert hierbei als standardisierte Schnittstelle, die es D3OS ermöglicht, hardwareunabhängig mit einem einheitlichen Treibermodell in virtualisierten Umgebungen zu agieren. In der Folge werden die Testbarkeit und Portabilität des Systems optimiert, was die Effizienz in der akademischen Lehre und Weiterentwicklung nachhaltig steigert.
+
+Um diesen Nutzen in D3OS verfügbar zu machen, bietet sich die Nutzung vorhandener, \texttt{no\_std}-fähiger VirtIO-Treiberbausteine in Rust an, die bereits mehrere gängige VirtIO-Geräteklassen abdecken.
 
 \clearpage
 
-\section{Checkliste}
+\section{Zielsetzung}
 
-Folgende Punkte sollten vor der Abgabe der Arbeit unbedingt nocheinmal geprüft werden (keine Garantie auf Vollständigkeit!).
+Ziel dieser Bachelorarbeit ist die Integration einer VirtIO-Treiberbasis in D3OS. Hierzu wird die Rust-Crate \textbf{virtio-drivers (rcore-os)} \cite{rcore_virtio} angebunden, sodass grundsätzlich eine Vielzahl von VirtIO-Geräten über ein einheitliches Treibermodell angesprochen werden kann. Dadurch entsteht eine wiederverwendbare Grundlage, um VirtIO-Geräte künftig mit geringem Zusatzaufwand zu aktivieren und in studentischen Projekten weiter auszubauen.
 
-\begin{enumerate}
- \item[$\square$] Das Dokument ist auf doppelseitigen Druck ausgelegt, d.h. unbedingt doppelseitig drucken lassen.
- \item[$\square$] Vor dem Hochladen \textbf{alles} nochmal kontrollieren.
- \item[$\square$] Sind alle Kapitel vorhanden?
- \item[$\square$] Ist das Inhaltsverzeichnis vollständig?
- \item[$\square$] Sind alle Bestandteile der Arbeit vorhanden (Titelblatt, Inhaltsverzeichnis, Anhang, Erklärung, etc.)
- \item[$\square$] Sind leere Abschnitte entfernt (z.B. keine Algorithmen im Algorithmusverzeichnis)?
- \item[$\square$] Sind alle Todos aus dem Dokument entfernt und erledigt? 
- \item[$\square$] Steht das richtige Datum auf der Arbeit?
- \item[$\square$] Das Thema muss \textbf{exakt} so formuliert sein, wie bei der Anmeldung der Arbeit.
- \item[$\square$] Die Arbeit ist digital als PDF im Studierendenportal einzureichen.
- \item[$\square$] Jegliche digitalen Dokumente, Quellcode, Programme, Messergebnisse und Anleitungen für den Aufbau von Testumgebungen sowie der LaTeX-Quelltext zur Arbeit selbst müssen zum Zeitpunkt der Abgabe im GitLab Repository vorhanden sein.
-\end{enumerate}
+Auf dieser Basis fokussiert die Arbeit zwei konkrete Funktionsbereiche:
+
+\begin{itemize}
+    \item Grafikunterstützung über VirtIO-GPU: Der in der Crate vorhandene GPU-Treiber wird nutzbar gemacht und anschließend funktional erweitert, um VirGL-Fähigkeiten zu unterstützen und zu demonstrieren.
+    \item Audioausgabe über VirtIO-Sound: Zusätzlich wird VirtIO-Sound verwendet, um eine Audioausgabe bereitzustellen. Darauf aufbauend wird exemplarisch ein einfacher Audioplayer realisiert, der die praktische Nutzbarkeit der Audio-Schnittstelle demonstriert.
+\end{itemize}
+
+Zur Einordnung und Bewertung der grafischen Integration werden die bestehenden Demoprogramme (Pong- und Rectangle-Demo) aus der Arbeit von Nikita Elrich so angepasst, dass sie auch mit der Crate-basierten Implementierung lauffähig sind. Außerdem werden Treiber- und Demo-Code erweitert, um Resize (dynamische Änderungen der Auflösung) zu unterstützen. Abschließend erfolgt ein Performance-Vergleich zwischen einer WSL2-Umgebung und einem nativen Ubuntu-Host, wobei identische Testszenarien und Messbedingungen verwendet werden, um die Auswirkungen der unterschiedlichen Hypervisor-Architekturen auf die grafische Ausgabe zu evaluieren.\\
+\\
+Für die VirGL-Unterstützung wird darüber hinaus ein minimalistischer Testaufbau umgesetzt, der einen einfachen VirGL-Command-Stream generiert und an den Host sendet. Damit wird gezeigt, dass der Host die Kommandos annimmt und verarbeitet, was die grundsätzliche Umsetzbarkeit des VirGL-Ansatzes belegt.\\
+\\
+Ein vollständiger Funktionstest aller in virtio-drivers enthaltenen Treiber ist nicht Gegenstand dieser Arbeit, jedoch ist die Integration so ausgelegt, dass zusätzliche VirtIO-Geräte einheitlich initialisiert, und anschließend mit geringem Anpassungsaufwand in eigenen Anwendungen oder studentischen Erweiterungen genutzt werden können.
+
+\section{Verwendete Hilfsmittel}
+
+Im Rahmen dieser Arbeit wurden verschiedene digitale Hilfsmittel eingesetzt. Zur Unterstützung bei der Entwicklung und Überarbeitung von Code sowie bei technischen Fragestellungen kamen ChatGPT und Google Gemini zum Einsatz. Darüber hinaus wurden diese Werkzeuge punktuell zur Unterstützung bei der LaTeX-Formatierung und bei der sprachlichen Ausarbeitung genutzt, etwa zur Verbesserung von Formulierungen, Struktur und Verständlichkeit.
+
+\clearpage
+
+\section{Aufbau}
+
+Kapitel 2 stellt die technischen Grundlagen bereit, die für das Verständnis der Arbeit erforderlich sind. Dazu werden Virtualisierung und paravirtualisierte Geräte eingeordnet, die VirtIO-Architektur mit Virtqueues und Benachrichtigungsmechanismen erläutert sowie die gerätespezifischen Konzepte von VirtIO-GPU (inkl. VirGL/3D-Erweiterung) und VirtIO-Sound vorgestellt.\\
+\\
+Kapitel 3 beschreibt das Integrationskonzept der Treiberbasis virtio-drivers in D3OS und die dafür notwendigen Anpassungen im System. Im Fokus stehen dabei die Einbindung der Crate in die Kernelarchitektur, die Bereitstellung von DMA-fähigem Speicher, die Implementierung der HAL-Schnittstelle sowie die Geräteinitialisierung über PCI inklusive Mapping und Interrupt-Anbindung. Darauf aufbauend werden das Event-/Interrupt-Konzept, die zentrale Bereitstellung der Treiberinstanzen und die Umsetzung von VirtIO-Sound samt Beispielanwendung behandelt.\\
+\\
+Kapitel 4 vertieft anschließend den GPU-Teil und dokumentiert die Erweiterungen am VirtIO-GPU-Treiber. Hierzu zählen die Ergänzungen für VirGL und 3D-Kommandos, der zugehörige Smoke Test als funktionsbezogener End-to-End-Nachweis, die Umsetzung von Resize-Unterstützung sowie Anpassungen an den Demos (Kompatibilität/Synchronisation) für die Nutzung der neuen Treiberbasis.\\
+\\
+Kapitel 5 evaluiert die praktische Nutzbarkeit der Integration in drei Dimensionen: die Ausgabe des VirGL Smoke Tests, die Validierung der Audioausgabe über VirtIO-Sound (PCM-Playback) und eine quantitative Leistungsbewertung der Grafikpipeline anhand der Rectangle-Demo; die Ergebnisse werden abschließend diskutiert.\\
+\\
+Kapitel 6 fasst die wesentlichen Ergebnisse der Arbeit zusammen und ordnet sie im Hinblick auf die eingangs formulierte Zielsetzung ein. Dabei wird bewertet, inwieweit die Integration der VirtIO-Treiberbasis in D3OS sowie die exemplarische Umsetzung von VirtIO-GPU (inkl. VirGL) und VirtIO-Sound erfolgreich realisiert werden konnten. Abschließend werden zentrale Einschränkungen der Arbeit benannt und ein Ausblick auf mögliche weiterführende Entwicklungen und Erweiterungen gegeben.
+
+\clearpage
+
+\section{Begriffe}
+
+Zum besseren Verständnis der technischen Ausführungen werden im Folgenden zentrale Fachbegriffe und Abkürzungen kurz erläutert, die im Kontext der VirtIO-Treiberentwicklung und Systemprogrammierung verwendet werden.
+
+\begin{itemize}
+	\item \textbf{Mutex (Mutual Exclusion):} Ein Synchronisationsobjekt, das sicherstellt, dass zu jedem Zeitpunkt nur ein Thread oder Prozess auf eine gemeinsame Ressource zugreifen kann.
+	\item \textbf{Interrupt Storm:} Ein Zustand, bei dem das System so viele Unterbrechungsanforderungen (Interrupts) in kurzer Zeit erhält, dass es fast ausschließlich mit deren Verarbeitung beschäftigt ist und die normale Programmausführung stagniert.
+	\item \textbf{DMA (Direct Memory Access):} Ein Verfahren, bei dem Hardware-Komponenten direkt auf den Arbeitsspeicher zugreifen können, ohne die CPU für den Datentransfer zu belasten.
+	\item \textbf{Scatter-Gather:} Eine Technik beim DMA-Transfer, die es ermöglicht, Daten aus mehreren nicht zusammenhängenden Speicherblöcken in einer einzigen Transaktion zu lesen oder zu schreiben.
+	\item \textbf{PCI Transport:} Die spezifische Schicht innerhalb des VirtIO-Protokolls, welche die Kommunikation zwischen dem Gast-System und den virtuellen Geräten über den PCI-Bus (Peripheral Component Interconnect) abwickelt.
+	\item \textbf{HAL (Hardware Abstraction Layer):} Eine Softwareschicht, die hardwarenahe Funktionen abstrahiert, um dem darüberliegenden Treiber (hier der \texttt{virtio-drivers} Crate) eine einheitliche Schnittstelle unabhängig von der konkreten Plattform zu bieten.
+	\item \textbf{MMIO (Memory-Mapped I/O):} Eine Methode zur Kommunikation mit Hardware, bei der Geräteregister in den Adressraum des Arbeitsspeichers eingeblendet werden, sodass die CPU sie wie normalen Speicher lesen und beschreiben kann.
+	\item \textbf{„in flight“:} Ein Begriff für Operationen oder Datenpakete, die bereits angestoßen, aber noch nicht vollständig vom Empfänger oder der Hardware verarbeitet und quittiert wurden.
+	\item \textbf{BAR (Base Address Register):} Ein Konfigurationsregister im PCI"=Konfigurationsraum, das definiert, an welcher Adresse im Speicher oder I/O-Bereich die Register eines Geräts für die CPU erreichbar sind.
+	\item \textbf{PCM (Pulse Code Modulation):} Ein Verfahren zur digitalen Repräsentation analoger Signale, das im VirtIO-Sound-Treiber verwendet wird, um unkomprimierte Audiodaten (Samples) zu übertragen.
+	\item \textbf{Fence:} Ein Synchronisationsobjekt im 3D-Befehlsstrom, das es dem Treiber ermöglicht, festzustellen, wann die GPU eine bestimmte Menge an Befehlen abgearbeitet hat.
+\end{itemize}
+	
