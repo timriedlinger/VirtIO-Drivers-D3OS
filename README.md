@@ -24,4 +24,20 @@
 
 - **Performance-Test**  
   - Benchmarking der GPU-Integration
-  - Vergleich WSL2 und Ubuntu25 als Host 
+  - Vergleich WSL2 und Ubuntu25 als Host
+
+# Build and Run
+
+- **Ergänzung in Makefile.toml** 
+  - "-display", "gtk,gl=on",
+  - "-device", "virtio-vga-gl",
+  - "-device", "virtio-sound-pci,audiodev=audio0",
+
+- **Demo starten (in boot.rs)**
+  - play_pcm_file();
+  - test_virgl();
+  - rectangle_demo(gpu_mutex);
+  
+- **Sonstiges** 
+  - Git Version: 92cb6f3
+  - Compiler: rustc 1.91.0-nightly (fe5536432 2025-08-29)
