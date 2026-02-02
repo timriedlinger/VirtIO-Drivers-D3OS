@@ -50,7 +50,7 @@ const CMD_SUBMIT_3D: Command = Command(0x207);
   \end{rustcode}
 \end{codeblock}
 
-Die zugehörigen Request-Strukturen werden im Treiber als \code{#[repr(C)]}-Strukturen definiert. Damit ist sichergestellt, dass das Speicherlayout den Spezifikationsstrukturen entspricht. In Kombination mit den verwendeten Zerocopy-Traits (\code{IntoBytes}, \code{FromBytes}, \code{KnownLayout}, \code{Immutable}) können Requests deterministisch in einen Sendepuffer geschrieben und Responses zuverlässig aus einem Empfangspuffer gelesen werden.
+Die zugehörigen Request-Strukturen werden im Treiber als \code{\#[repr(C)]}-Strukturen definiert. Damit ist sichergestellt, dass das Speicherlayout den Spezifikationsstrukturen entspricht. In Kombination mit den verwendeten Zerocopy-Traits (\code{IntoBytes}, \code{FromBytes}, \code{KnownLayout}, \code{Immutable}) können Requests deterministisch in einen Sendepuffer geschrieben und Responses zuverlässig aus einem Empfangspuffer gelesen werden.
 
 Die neu eingeführten Typen werden im Folgenden funktional gruppiert:
 
