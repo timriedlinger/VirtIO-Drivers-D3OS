@@ -3,8 +3,6 @@
     <img src="https://coconucos.cs.hhu.de/lehre/bigdata/resources/img/hhu-logo.svg" width="300">
   </a>
 
-  <br><br>
-
   <a href="./Tim_Riedlinger_Bachelorarbeit.pdf">
     <img src="https://img.shields.io/static/v1?label=&message=pdf&color=EE3F24&style=for-the-badge&logo=adobe-acrobat-reader&logoColor=FFFFFF" alt="PDF">
   </a>
